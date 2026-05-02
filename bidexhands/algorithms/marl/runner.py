@@ -2,6 +2,7 @@ from curses import KEY_SUSPEND
 from datetime import datetime
 import os
 import time
+import shutil
 
 from gym.spaces import Space
 
@@ -50,10 +51,12 @@ class Runner:
         self.use_eval = config["use_eval"]
         self.eval_interval = config["eval_interval"]
         self.eval_episodes = config["eval_episodes"]
+        self.eval_log_interval_episodes = config.get("eval_log_interval_episodes", 200)
         self.log_interval = config["log_interval"]
 
         self.seed = self.envs.task.cfg["seed"]
         self.model_dir = model_dir
+        self.eval_only = self.model_dir != ""
 
         self.num_agents = self.envs.num_agents
         self.device = self.envs.rl_device
@@ -66,7 +69,12 @@ class Runner:
         self.log_dir = str(self.run_dir + '/' + self.env_name + '/' + self.algorithm_name +'/logs_seed{}'.format(self.seed))
         if not os.path.exists(self.log_dir):
             os.makedirs(self.log_dir)
-        self.writter = SummaryWriter(self.log_dir)
+        self.writter = None if self.eval_only else SummaryWriter(self.log_dir)
+        self.eval_log_dir = os.path.join(self.log_dir, "eval")
+        if self.eval_only and os.path.exists(self.eval_log_dir):
+            shutil.rmtree(self.eval_log_dir)
+        os.makedirs(self.eval_log_dir, exist_ok=True)
+        self.eval_writter = SummaryWriter(self.eval_log_dir)
         self.save_dir = str(self.run_dir + '/' + self.env_name + '/' + self.algorithm_name + '/models_seed{}'.format(self.seed))
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
@@ -176,8 +184,9 @@ class Runner:
             if len(done_episodes_rewards) != 0:
                 aver_episode_rewards = torch.stack(done_episodes_rewards).mean()
                 print("some episodes done, average rewards: ", aver_episode_rewards)
-                self.writter.add_scalars("train_episode_rewards", {"aver_rewards": aver_episode_rewards},
-                                            total_num_steps)
+                if self.writter is not None:
+                    self.writter.add_scalars("train_episode_rewards", {"aver_rewards": aver_episode_rewards},
+                                                total_num_steps)
 
             # eval
             if episode % self.eval_interval == 0 and self.use_eval:
@@ -259,7 +268,8 @@ class Runner:
             train_infos[agent_id]["average_step_rewards"] = np.mean(self.buffer[agent_id].rewards)
             for k, v in train_infos[agent_id].items():
                 agent_k = "agent%i/" % agent_id + k
-                self.writter.add_scalars(agent_k, {agent_k: v}, total_num_steps)
+                if self.writter is not None:
+                    self.writter.add_scalars(agent_k, {agent_k: v}, total_num_steps)
 
 
     def train(self):
@@ -345,12 +355,20 @@ class Runner:
 
     def log_env(self, env_infos, total_num_steps):
         for k, v in env_infos.items():
-            self.writter.add_scalars(k, {k: torch.mean(v)}, total_num_steps)
+            scalar_value = torch.mean(v)
+            if k.startswith("eval_"):
+                tag = k[len("eval_"):]
+                self.eval_writter.add_scalar(tag, scalar_value, total_num_steps)
+            else:
+                if self.writter is not None:
+                    self.writter.add_scalar(k, scalar_value, total_num_steps)
 
     @torch.no_grad()
     def eval(self, total_num_steps):
         eval_episode = 0
         eval_episode_rewards = []
+        eval_episode_successes = []
+        next_log_episode = self.eval_log_interval_episodes
         one_episode_rewards = []
         for eval_i in range(self.n_eval_rollout_threads):
             one_episode_rewards.append([])
@@ -396,15 +414,44 @@ class Runner:
                 if eval_dones_env[eval_i]:
                     eval_episode += 1
                     eval_episode_rewards.append(torch.sum(torch.cat(one_episode_rewards[eval_i]), dim=0))
+                    task_extras = getattr(self.eval_envs.task, "extras", None)
+                    if isinstance(task_extras, dict) and "successes" in task_extras:
+                        success_flag = (task_extras["successes"][eval_i].to(self.device) > 0).float().view(1)
+                    else:
+                        success_flag = torch.zeros(1, device=self.device)
+                    eval_episode_successes.append(success_flag)
                     one_episode_rewards[eval_i] = []
+
+            while eval_episode >= next_log_episode and next_log_episode <= self.eval_episodes:
+                partial_rewards = torch.cat(eval_episode_rewards, dim=-1)
+                partial_successes = torch.cat(eval_episode_successes, dim=0) if len(eval_episode_successes) > 0 else torch.zeros(1, device=self.device)
+                partial_infos = {
+                    'eval_average_episode_rewards': torch.mean(partial_rewards),
+                    'eval_max_episode_rewards': torch.max(partial_rewards),
+                    'eval_success_rate': torch.mean(partial_successes),
+                    'eval_success_episodes': torch.sum(partial_successes)
+                }
+                # Use an offset step so a single --test run produces a visible curve.
+                self.log_env(partial_infos, total_num_steps + next_log_episode)
+                next_log_episode += self.eval_log_interval_episodes
 
             if eval_episode >= self.eval_episodes:
                 eval_episode_rewards = torch.cat(eval_episode_rewards,dim=-1)
+                if len(eval_episode_successes) > 0:
+                    eval_episode_successes = torch.cat(eval_episode_successes, dim=0)
+                    eval_success_rate = torch.mean(eval_episode_successes)
+                    eval_success_episodes = torch.sum(eval_episode_successes)
+                else:
+                    eval_success_rate = torch.tensor(0.0, device=self.device)
+                    eval_success_episodes = torch.tensor(0.0, device=self.device)
                 eval_env_infos = {'eval_average_episode_rewards': torch.mean(eval_episode_rewards),
-                                  'eval_max_episode_rewards': torch.max(eval_episode_rewards)}
+                                  'eval_max_episode_rewards': torch.max(eval_episode_rewards),
+                                  'eval_success_rate': eval_success_rate,
+                                  'eval_success_episodes': eval_success_episodes}
                 print(eval_env_infos)
-                self.log_env(eval_env_infos, total_num_steps)
+                self.log_env(eval_env_infos, total_num_steps + eval_episode)
                 print("eval_average_episode_rewards is {}.".format(torch.mean(eval_episode_rewards)))
+                print("eval_success_rate is {}.".format(eval_success_rate))
                 break
 
     @torch.no_grad()

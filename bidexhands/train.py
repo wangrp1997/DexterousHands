@@ -37,7 +37,8 @@ def train():
         task, env = parse_task(args, cfg, cfg_train, sim_params, agent_index)
         runner = eval('process_{}'.format(algo))(args, env, cfg_train, args.model_dir)
         if args.model_dir != "":
-            runner.eval(1000)
+            # Align first eval partial TB step to 0 (runner uses total_num_steps + eval_log_interval).
+            runner.eval(-200)
         else:
             runner.run()
         return

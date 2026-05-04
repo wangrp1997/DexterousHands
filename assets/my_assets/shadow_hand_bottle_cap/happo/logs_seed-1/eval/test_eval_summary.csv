@@ -1,0 +1,2 @@
+iso_time,task,algorithm,seed,model_dir,eval_episodes,eval_total_num_steps_arg,final_tb_step,average_episode_rewards,max_episode_rewards,success_rate,success_episodes
+2026-05-04T22:09:36,shadow_hand_bottle_cap,happo,-1,logs/shadow_hand_bottle_cap/happo/models_seed-1,10000,-200,10040,509.3003845214844,821.4404296875,0.24990235269069672,2559.0

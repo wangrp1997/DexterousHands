@@ -1,4 +1,4 @@
-from curses import KEY_SUSPEND
+import csv
 from datetime import datetime
 import os
 import time
@@ -363,6 +363,41 @@ class Runner:
                 if self.writter is not None:
                     self.writter.add_scalar(k, scalar_value, total_num_steps)
 
+    def _append_test_eval_summary_row(
+        self, eval_env_infos, total_num_steps_arg: int, final_tb_step: int
+    ) -> None:
+        """Append one CSV row after --test (eval_only) with final eval metrics."""
+
+        def _scalar(x):
+            if torch.is_tensor(x):
+                return float(x.detach().cpu().item())
+            return float(x)
+
+        # Under eval/ so it is removed with the eval directory on the next --test startup.
+        path = os.path.join(self.eval_log_dir, "test_eval_summary.csv")
+        row = {
+            "iso_time": datetime.now().isoformat(timespec="seconds"),
+            "task": self.env_name,
+            "algorithm": self.algorithm_name,
+            "seed": str(self.seed),
+            "model_dir": str(self.model_dir),
+            "eval_episodes": int(self.eval_episodes),
+            "eval_total_num_steps_arg": int(total_num_steps_arg),
+            "final_tb_step": int(final_tb_step),
+            "average_episode_rewards": _scalar(eval_env_infos["eval_average_episode_rewards"]),
+            "max_episode_rewards": _scalar(eval_env_infos["eval_max_episode_rewards"]),
+            "success_rate": _scalar(eval_env_infos["eval_success_rate"]),
+            "success_episodes": _scalar(eval_env_infos["eval_success_episodes"]),
+        }
+        fieldnames = list(row.keys())
+        new_file = (not os.path.exists(path)) or os.path.getsize(path) == 0
+        with open(path, "a", newline="") as fp:
+            w = csv.DictWriter(fp, fieldnames=fieldnames)
+            if new_file:
+                w.writeheader()
+            w.writerow(row)
+        print("Appended test summary -> {}".format(path))
+
     @torch.no_grad()
     def eval(self, total_num_steps):
         eval_episode = 0
@@ -449,7 +484,14 @@ class Runner:
                                   'eval_success_rate': eval_success_rate,
                                   'eval_success_episodes': eval_success_episodes}
                 print(eval_env_infos)
-                self.log_env(eval_env_infos, total_num_steps + eval_episode)
+                final_step = int(total_num_steps + eval_episode)
+                self.log_env(eval_env_infos, final_step)
+                if self.eval_only:
+                    self._append_test_eval_summary_row(
+                        eval_env_infos,
+                        total_num_steps_arg=int(total_num_steps),
+                        final_tb_step=final_step,
+                    )
                 print("eval_average_episode_rewards is {}.".format(torch.mean(eval_episode_rewards)))
                 print("eval_success_rate is {}.".format(eval_success_rate))
                 break

@@ -38,6 +38,27 @@ def smooth(y, radius, mode='two_sided', valid_only=False):
     return out
 
 
+def smooth_window_ymin_ymax(y, radius):
+    """Per-index min/max of raw y over the same index window as smooth() (two_sided)."""
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    lo = np.empty(n, dtype=float)
+    hi = np.empty(n, dtype=float)
+    if radius <= 0:
+        lo[:] = hi[:] = y
+        return lo, hi
+    if n < 2 * radius + 1:
+        lo[:] = np.min(y)
+        hi[:] = np.max(y)
+        return lo, hi
+    for i in range(n):
+        a = max(0, i - radius)
+        b = min(n, i + radius + 1)
+        lo[i] = np.min(y[a:b])
+        hi[i] = np.max(y[a:b])
+    return lo, hi
+
+
 COLORS = (
     [
         # deepmind style
@@ -110,19 +131,32 @@ def plot_ax(
 
     for index, csv_file in enumerate(file_lists):
         csv_dict = csv2numpy(csv_file)
-        x, y = csv_dict[xkey], csv_dict[ykey]
-        y = smooth(y, radius=smooth_radius)
+        x = csv_dict[xkey]
+        y_raw = np.asarray(csv_dict[ykey], dtype=float)
+        y_line = smooth(y_raw, radius=smooth_radius)
         color = COLORS[index % len(COLORS)]
-        ax.plot(x, y, color=color)
-        if shaded_std and ykey + ':shaded' in csv_dict:
-            y_shaded = smooth(csv_dict[ykey + ':shaded'], radius=smooth_radius)
-            ax.fill_between(x, y - y_shaded, y + y_shaded, color=color, alpha=.2)
+        # label= ties legend colors to this Line2D; legend(list_of_str) uses default colors.
+        ax.plot(x, y_line, color=color, label=legneds[index])
+        if not shaded_std:
+            continue
+        # Multi-seed: tools.py rew:shaded (cross-seed std). Single-seed + --smooth: fill
+        # between rolling min/max of raw rew in the same window as smooth() — band width
+        # is exactly the spread of original points in that window (not std).
+        used_csv_shaded = False
+        if ykey + ":shaded" in csv_dict:
+            y_csv = np.asarray(csv_dict[ykey + ":shaded"], dtype=float)
+            if np.nanmax(np.abs(y_csv)) > 1e-12:
+                y_band = smooth(y_csv, radius=smooth_radius)
+                ax.fill_between(x, y_line - y_band, y_line + y_band, color=color, alpha=0.2)
+                used_csv_shaded = True
+        if not used_csv_shaded and smooth_radius > 0:
+            y_lo, y_hi = smooth_window_ymin_ymax(y_raw, smooth_radius)
+            ax.fill_between(x, y_lo, y_hi, color=color, alpha=0.2)
 
-    ax.legend(
-        legneds,
-        loc=2 if legend_outside else None,
-        bbox_to_anchor=(1, 1) if legend_outside else None
-    )
+    if legend_outside:
+        ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+    else:
+        ax.legend(loc="upper left")
     ax.xaxis.set_major_formatter(mticker.EngFormatter())
     if xlim is not None:
         ax.set_xlim(xmin=0, xmax=xlim)
@@ -209,7 +243,8 @@ if __name__ == "__main__":
     parser.add_argument(
         '--shaded-std',
         action='store_true',
-        help='shaded region corresponding to standard deviation of the group'
+        help='Multi-seed: use CSV rew:shaded (cross-seed std). Single-seed with --smooth>0: '
+        'shade min..max of raw rew in the same sliding window as smooth (data spread).'
     )
     parser.add_argument(
         '--sharex',
@@ -259,6 +294,12 @@ if __name__ == "__main__":
         '--dpi', type=int, default=200, help='figure dpi (default: 200)'
     )
     args = parser.parse_args()
+    cwd_start = os.getcwd()
+    # Resolve before chdir: plot_figure ends with chdir to root_dir, and a fragile "../../"
+    # would break paths like ./bidexhands/logs/.../figure.png (duplicate bidexhands).
+    output_abs = os.path.abspath(os.path.join(cwd_start, args.output_path))
+    os.makedirs(os.path.dirname(output_abs) or ".", exist_ok=True)
+
     file_lists = find_all_files(args.root_dir, re.compile(args.file_pattern))
     file_lists = [os.path.relpath(f, args.root_dir) for f in file_lists]
     if args.style:
@@ -280,14 +321,11 @@ if __name__ == "__main__":
         sharey=args.sharey,
         smooth_radius=args.smooth,
         shaded_std=args.shaded_std,
-        legend_outside=args.legend_outside
+        legend_outside=args.legend_outside,
     )
 
-    os.chdir('../../')
-    abs_path = os.path.abspath('{}'.format(args.output_path))
-    args.output_path = abs_path
-
-    if args.output_path:
-        plt.savefig(args.output_path, dpi=args.dpi, bbox_inches='tight')
+    os.chdir(cwd_start)
+    if output_abs:
+        plt.savefig(output_abs, dpi=args.dpi, bbox_inches='tight')
     if args.show:
         plt.show()

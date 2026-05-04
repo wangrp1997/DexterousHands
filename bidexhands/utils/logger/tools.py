@@ -40,6 +40,15 @@ def csv2numpy(csv_file):
     return {k: np.array(v) for k, v in csv_dict.items()}
 
 
+def _marl_train_reward_scalar_tag(ea):
+    """Tag written by SummaryWriter.add_scalars('train_episode_rewards', {'aver_rewards': ...})."""
+    scalars = ea.Tags().get("scalars", []) or []
+    for tag in ("train_episode_rewards/aver_rewards", "train_episode_rewards"):
+        if tag in scalars:
+            return tag
+    return None
+
+
 def convert_tfevents_to_csv(root_dir, alg_type, env_num, env_step, refresh=False):
     """Recursively convert test/rew from all tfevent file under root_dir to csv.
 
@@ -51,7 +60,13 @@ def convert_tfevents_to_csv(root_dir, alg_type, env_num, env_step, refresh=False
     if alg_type == 'sarl':
         tfevent_files = find_all_files(root_dir, re.compile(r"^.*tfevents.*$"))
     elif alg_type == 'marl':
-        tfevent_files = find_all_files(root_dir, re.compile(r"^.*tfevents.*.13$"))
+        # Older TensorBoard used a ".13" suffix; PyTorch SummaryWriter emits names like "... .0".
+        tfevent_files = find_all_files(root_dir, re.compile(r"^.*tfevents.*$"))
+        # Training scalars live under logs_seed*/ ; eval writer is under logs_seed*/eval/
+        ev = f"{os.sep}eval{os.sep}"
+        tfevent_files = [f for f in tfevent_files if ev not in f]
+        # Bi-DexHands MARL reward is logged in a dedicated subdir (add_scalars layout), not the root tfevents.
+        tfevent_files = [f for f in tfevent_files if "train_episode_rewards" in f]
     else:
         print("wrong alg_type!")
 
@@ -89,7 +104,10 @@ def convert_tfevents_to_csv(root_dir, alg_type, env_num, env_step, refresh=False
                     )
         
             elif alg_type == 'marl':
-                for i, test_rew in enumerate(ea.scalars.Items("train_episode_rewards")):
+                reward_tag = _marl_train_reward_scalar_tag(ea)
+                if reward_tag is None:
+                    continue
+                for i, test_rew in enumerate(ea.scalars.Items(reward_tag)):
                     content.append(
                         [
                             test_rew.step,
@@ -97,7 +115,9 @@ def convert_tfevents_to_csv(root_dir, alg_type, env_num, env_step, refresh=False
                             round(test_rew.wall_time - initial_time, 4),
                         ]
                     )
-                    
+
+            if len(content) <= 1:
+                continue
             csv.writer(open(output_file, 'w')).writerows(content)
             result[output_file] = content
     return result
@@ -172,4 +192,12 @@ if __name__ == "__main__":
     args.root_dir = '{}/{}'.format(args.root_dir,args.alg_name)
 
     csv_files = convert_tfevents_to_csv(args.root_dir, args.alg_type, args.env_num, args.env_step, args.refresh)
+    if not csv_files:
+        raise SystemExit(
+            f"No tfevents converted under {args.root_dir!r}. "
+            "Check --alg-name matches the folder under your task logs; training must have produced "
+            "TensorBoard files under logs_seed*/train_episode_rewards_*/. "
+            "If you launched train from the bidexhands directory, use e.g. "
+            "--root-dir ./bidexhands/logs/<task_name> (not ./logs/... unless logs are at repo root)."
+        )
     merge_csv(csv_files, args.root_dir, args.remove_zero)
